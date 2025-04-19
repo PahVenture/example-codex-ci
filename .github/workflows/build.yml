@@ -1,0 +1,86 @@
+name: Build .NET App
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '9.0.x'
+        
+    - name: Restore dependencies
+      run: dotnet restore
+      
+    - name: Build
+      run: dotnet build --configuration Release
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '9.0.x'
+        
+    - name: Restore dependencies
+      run: dotnet restore
+      
+    - name: Run tests
+      run: dotnet run --configuration Release
+
+  create-issue:
+    needs: [build, test]
+    if: always() && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Create GH Issue
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GH_TOKEN }}
+          script: |
+            const issueTitle = `🐛 Runtime Exception: ${context.workflow} (#${context.runNumber})`;
+            const issueBody = `## Runtime Exception
+
+            Tests failed with runtime exception at ${context.payload.repository.updated_at}
+
+            ### Build Information
+            - Workflow: ${context.workflow}
+            - Run ID: ${context.runId}
+            - Run Number: ${context.runNumber}
+            - Triggered by: ${context.actor}
+            - Workflow URL: https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}
+            - Branch: ${context.ref.split('/').slice(-1)[0]}
+            - Commit: ${context.sha}
+
+            Please check the logs and fix the build.
+            _(This issue was created automatically.)_`;
+            
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: issueTitle,
+              body: issueBody,
+              labels: ['bug', 'runtime-exception', 'auto-diagnostic'],
+              assignees: [context.actor]
+            });
+            
+            console.log(`Issue created: ${issue.data.html_url}`);

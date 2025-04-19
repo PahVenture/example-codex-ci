@@ -1,0 +1,420 @@
+name: Auto Diagnostic
+
+on:
+  issues:
+    types: [opened, labeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  run-diagnostic:
+    if: >
+      (github.event.action == 'opened' && contains(github.event.issue.labels.*.name, 'auto-diagnostic')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'auto-diagnostic')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      actions: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Build Logs
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            // Create logs directory
+            const logsDir = 'logs';
+            if (!fs.existsSync(logsDir)) {
+              fs.mkdirSync(logsDir);
+            }
+            
+            // Parse run ID from issue body
+            const issueBody = context.payload.issue.body;
+            
+            // Try different patterns to find a run ID
+            let runId = null;
+            
+            // Pattern 1: Look for GitHub Actions URL format
+            const actionUrlMatch = issueBody.match(/github\.com\/.*\/.*\/actions\/runs\/(\d+)/);
+            if (actionUrlMatch && actionUrlMatch[1]) {
+              runId = actionUrlMatch[1];
+              console.log(`Found run ID in GitHub Actions URL: ${runId}`);
+            }
+            
+            // Pattern 2: Look for run ID in plain text
+            if (!runId) {
+              const runIdMatch = issueBody.match(/Run ID: (\d+)/);
+              if (runIdMatch && runIdMatch[1]) {
+                runId = runIdMatch[1];
+                console.log(`Found run ID in text: ${runId}`);
+              }
+            }
+            
+            // Pattern 3: Look for workflow run number and find corresponding run ID
+            if (!runId) {
+              const runNumberMatch = issueBody.match(/Run Number: (\d+)/);
+              if (runNumberMatch && runNumberMatch[1]) {
+                const runNumber = runNumberMatch[1];
+                console.log(`Found run number: ${runNumber}, trying to find corresponding run ID`);
+                
+                try {
+                  // Get recent workflow runs
+                  const recentRuns = await github.rest.actions.listWorkflowRunsForRepo({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    per_page: 20
+                  });
+                  
+                  // Find the run with matching run number
+                  for (const run of recentRuns.data.workflow_runs) {
+                    if (run.run_number.toString() === runNumber) {
+                      runId = run.id.toString();
+                      console.log(`Found matching run ID ${runId} for run number ${runNumber}`);
+                      break;
+                    }
+                  }
+                } catch (error) {
+                  console.error(`Error listing workflow runs: ${error.message}`);
+                }
+              }
+            }
+            
+            if (!runId) {
+              const errorMsg = 'No run ID could be found in the issue. Please specify the GitHub Actions run ID in the issue body.';
+              console.log(errorMsg);
+              fs.writeFileSync(path.join(logsDir, 'error.txt'), errorMsg);
+              return;
+            }
+            
+            try {
+              console.log(`Downloading logs for run ID: ${runId}`);
+              
+              // Get workflow jobs
+              const jobs = await github.rest.actions.listJobsForWorkflowRun({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: runId
+              });
+              
+              if (!jobs.data.jobs || jobs.data.jobs.length === 0) {
+                const errorMsg = `No jobs found for run ID: ${runId}`;
+                console.log(errorMsg);
+                fs.writeFileSync(path.join(logsDir, 'error.txt'), errorMsg);
+                return;
+              }
+              
+              console.log(`Found ${jobs.data.jobs.length} jobs in the workflow run`);
+              
+              // Create metadata file with run information
+              const runMetadata = {
+                run_id: runId,
+                issue_number: context.payload.issue.number,
+                job_count: jobs.data.jobs.length,
+                downloaded_at: new Date().toISOString(),
+                workflow_name: jobs.data.jobs[0].workflow_name || 'Unknown'
+              };
+              
+              fs.writeFileSync(
+                path.join(logsDir, 'run-metadata.json'), 
+                JSON.stringify(runMetadata, null, 2)
+              );
+              
+              let allLogs = `# Workflow Run Logs
+              Run ID: ${runId}
+              Downloaded: ${new Date().toISOString()}
+              Total Jobs: ${jobs.data.jobs.length}
+
+              `;
+              
+              // Download logs for each job
+              for (const job of jobs.data.jobs) {
+                console.log(`Downloading logs for job: ${job.name} (${job.id})`);
+                allLogs += `\n\n## JOB: ${job.name} (${job.id})\nStatus: ${job.conclusion || job.status}\n\n`;
+                
+                try {
+                  const logs = await github.rest.actions.downloadJobLogsForWorkflowRun({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    job_id: job.id
+                  });
+                  
+                  const jobLogContent = logs.data;
+                  allLogs += jobLogContent;
+                  
+                  // Save individual job log
+                  const safeJobName = job.name.replace(/[^a-z0-9]/gi, '-').toLowerCase();
+                  fs.writeFileSync(path.join(logsDir, `job-${safeJobName}-${job.id}.txt`), jobLogContent);
+                } catch (error) {
+                  console.error(`Error downloading logs for job ${job.name}: ${error.message}`);
+                  const errorMsg = `Error downloading logs: ${error.message}`;
+                  allLogs += `\n${errorMsg}\n`;
+                  fs.writeFileSync(path.join(logsDir, `job-${job.id}-error.txt`), errorMsg);
+                }
+              }
+              
+              // Save combined logs
+              fs.writeFileSync(path.join(logsDir, 'full-build-log.txt'), allLogs);
+              console.log('All logs downloaded and saved successfully');
+            } catch (error) {
+              console.error(`Error downloading logs: ${error.message}`);
+              fs.writeFileSync(path.join(logsDir, 'error.txt'), `Failed to download logs: ${error.message}`);
+            }
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          check-latest: true
+
+      - name: Install Codex CLI
+        run: |
+          npm install -g @openai/codex
+
+      - name: Analyze issue with Codex
+        id: codex_analysis
+        # Only run if the log download step succeeded (assuming previous step sets output correctly)
+        # if: steps.download_logs.outputs.logDownloadError == ''
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_KEY }}
+          # Pass the issue body as an environment variable
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          echo "Running Codex analysis..."
+
+          LOG_FILE_PATH="logs/full-build-log.txt"
+          if [ ! -f "$LOG_FILE_PATH" ]; then
+            echo "Log file '$LOG_FILE_PATH' not found. Skipping Codex analysis."
+            echo "::set-output name=codex_skipped::true"
+            exit 0 # Exit successfully, let commenting step handle explanation
+          fi
+          echo "::set-output name=codex_skipped::false"
+
+          # Refined Prompt: Explicitly instruct it to use apply_patch if needed.
+          CODEX_PROMPT=$(cat <<EOF
+          Using the logs in '$LOG_FILE_PATH' and the issue description (env var ISSUE_BODY).
+          Fix the issue.
+          EOF
+          )
+
+          # Define the minimal valid empty patch structure
+          EMPTY_PATCH=$(cat <<EOF
+          *** Begin Patch
+          *** End Patch
+          EOF
+          )
+
+          echo "::group::Codex Prompt"
+          echo "$CODEX_PROMPT"
+          echo "::endgroup::"
+
+          echo "::group::Empty Patch Input"
+          echo "$EMPTY_PATCH"
+          echo "::endgroup::"
+
+          # Run Codex, piping the EMPTY_PATCH to its stdin.
+          # Add '|| true' to ignore non-zero exit codes from codex itself.
+          set +e # Prevent errexit from stopping the script on codex failure
+          echo "$EMPTY_PATCH" | timeout 5m codex --full-auto --quiet --dangerously-auto-approve-everything "$CODEX_PROMPT"
+          EXIT_CODE=$?
+          set -e # Re-enable errexit
+
+          cat Program.cs
+
+          # Log the exit code but don't fail the step based on it or set error output
+          echo "Codex command finished with exit code $EXIT_CODE."
+          if [ $EXIT_CODE -eq 124 ]; then
+            echo "Codex command timed out after 5 minutes."
+            # echo "::set-output name=codex_error::Codex command timed out." # Keep error output minimal unless needed downstream
+          elif [ $EXIT_CODE -ne 0 ]; then
+             # Don't echo the error here if it's the expected exit code 1 from the patch stdin issue
+             if [ $EXIT_CODE -ne 1 ]; then
+                echo "Codex command exited non-zero (Code: $EXIT_CODE)."
+             else
+                echo "Codex command exited with code 1 (potentially expected due to stdin patch interaction). Checking for changes..."
+             fi
+          else
+            echo "Codex command exited zero."
+          fi
+          # Reset error output regardless of non-timeout error, rely on git status
+          echo "::set-output name=codex_error::"
+
+      - name: Check for changes
+        id: check_changes
+        run: |
+          if [[ -n "$(git status --porcelain)" ]]; then
+            echo "Changes detected - Codex made modifications"
+            echo "::set-output name=has_changes::true"
+          else
+            echo "No changes detected - Codex did not make modifications"
+            echo "::set-output name=has_changes::false"
+          fi
+
+      - name: Commit changes if any
+        run: |
+          # Configure Git
+          git config --global user.name "AutoDiagnostic Bot"
+          git config --global user.email "autodiagnostic-bot@noreply.github.com"
+          
+          # Create a branch with issue number
+          ISSUE_NUM="${{ github.event.issue.number }}"
+          BRANCH_NAME="fix/issue-${ISSUE_NUM}"
+          git checkout -b "$BRANCH_NAME"
+          
+          # Add and commit changes
+          git add .
+          git commit -m "Auto fix for issue #$ISSUE_NUM" -m "Applied automatic fix based on build log diagnostics"
+          
+          # Push to the repository
+          git push origin "$BRANCH_NAME"
+          
+          # Store the branch name for later use
+          echo "FIX_BRANCH=$BRANCH_NAME" >> $GITHUB_ENV
+
+      - name: Upload Logs Artifact
+        uses: actions/upload-artifact@v4
+        # Always run to upload whatever logs/errors were generated
+        if: always()
+        with:
+          name: auto-diagnostic-logs-${{ steps.download_logs.outputs.extractedRunId || github.run_id }}
+          path: logs/
+
+      - name: Add Comment to Issue
+        # Always run this step to provide feedback
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // --- Get data from previous steps ---
+            const issueNumber = context.payload.issue.number;
+            const issueOwner = context.payload.issue.user.login;
+            const extractedRunId = "${{ steps.download_logs.outputs.extractedRunId }}";
+            const humanReadableRunId = "${{ steps.download_logs.outputs.humanReadableRunId }}";
+            const logDownloadError = "${{ steps.download_logs.outputs.logDownloadError || '' }}";
+            const codexSkipped = "${{ steps.codex_analysis.outputs.codex_skipped || 'false' }}" === 'true';
+            const codexError = "${{ steps.codex_analysis.outputs.codex_error || '' }}";
+            const issueSolved = "${{ steps.check_changes.outputs.has_changes || 'false' }}" === 'true';
+            const currentRunId = context.runId;
+            const fixBranch = process.env.FIX_BRANCH || '';
+            const diagnosticRunUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${currentRunId}`;
+
+            // --- Log current state for debugging ---
+            console.log(`Processing issue #${issueNumber} for build ${humanReadableRunId} (ID: ${extractedRunId}).`);
+            console.log(`  Log Download Error: '${logDownloadError}'`);
+            console.log(`  Codex Skipped: ${codexSkipped}`);
+            console.log(`  Codex Error: '${codexError}'`);
+            console.log(`  Issue Solved (Changes Detected): ${issueSolved}`);
+            console.log(`  Fix Branch: ${fixBranch}`);
+
+            // --- Determine comment body based on outcomes ---
+            let body = '';
+            let errorSummary = '';
+
+            // Check for errors first, in order of precedence
+            if (logDownloadError) {
+               errorSummary = `⚠️ Failed to process logs for build ${humanReadableRunId}.\n\n**Error:**\n\`\`\`\n${logDownloadError}\n\`\`\`\n`;
+            } else if (codexSkipped) {
+               errorSummary = `ℹ️ Codex analysis skipped for build ${humanReadableRunId}, likely because the log file could not be found or read.`;
+            } else if (codexError) {
+               errorSummary = `⚠️ Codex analysis encountered an error for build ${humanReadableRunId}.\n\n**Error:** ${codexError}`;
+            }
+
+            // Construct the comment body
+            if (errorSummary) {
+                // If there was any critical error, report it
+                body = `## Automatic Diagnostic Results\n${errorSummary}\n\nDiagnostic logs have been uploaded as artifacts:\n[View Diagnostic Run Details & Logs](${diagnosticRunUrl})\n\n@${issueOwner} - Please review the issue description and the original build run.`;
+            } else if (issueSolved) {
+              // If no errors and changes were detected
+              const branchInfo = fixBranch ? `\n\n**Fix Branch:** [${fixBranch}](https://github.com/${context.repo.owner}/${context.repo.repo}/tree/${fixBranch})` : '';
+              
+              body = `## Automatic Diagnostic Results
+              ✅ Attempted fix for build failure from ${humanReadableRunId}.
+
+              Codex applied changes to the code based on the logs. The changes have been committed to a new branch.${branchInfo}
+
+              Diagnostic logs and details of the changes applied are available here:
+              [View Diagnostic Run Details & Logs](${diagnosticRunUrl})
+
+              If the changes look correct, please test them by checking out the branch and running the build/tests locally. Further action might be needed.`;
+            } else {
+              // If no errors and no changes were detected
+              body = `## Automatic Diagnostic Results
+              ❌ Unable to automatically resolve the issue from build ${humanReadableRunId}.
+
+              Logs were processed, but no automated fix was applied by Codex.
+
+              Diagnostic logs are available here:
+              [View Diagnostic Run Details & Logs](${diagnosticRunUrl})
+
+              @${issueOwner} - Please review the logs and the issue description.`;
+            }
+
+            // --- Post the comment ---
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body: body
+              });
+              console.log(`Comment posted successfully to issue #${issueNumber}.`);
+            } catch (commentError) {
+              console.error(`Failed to post comment to issue #${issueNumber}: ${commentError.message}`);
+              core.setFailed(`Failed to post comment: ${commentError.message}`);
+            }
+      - name: Create Pull Request
+        if: steps.check_changes.outputs.has_changes == 'true'
+        id: create_pr
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GH_TOKEN }} # use own token to avoid pr creation permissions issues
+          script: |
+            const issueNumber = context.payload.issue.number;
+            const fixBranch = process.env.FIX_BRANCH;
+            const diagnosticRunUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            
+            let prCreationAttempted = false;
+            let prCreationSuccess = false;
+            let prUrl = '';
+            let prCreationError = '';
+            
+            // --- Create PR only if changes were committed and pushed ---
+            if (fixBranch) {
+              prCreationAttempted = true;
+              try {
+                console.log(`Attempting to create PR for branch ${fixBranch} targeting main`);
+                const pr = await github.rest.pulls.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: `Fix: Auto-resolve issue #${issueNumber}`,
+                  head: fixBranch,
+                  base: 'main',
+                  body: `Automated fix generated by diagnostic workflow for issue #${issueNumber}.\n\nCloses #${issueNumber}\n\nSee diagnostic run: ${diagnosticRunUrl}`
+                });
+                console.log(`Pull request created successfully: ${pr.data.html_url}`);
+                prCreationSuccess = true;
+                prUrl = pr.data.html_url;
+              } catch (error) {
+                console.error(`Failed to create pull request for branch ${fixBranch}: ${error.message}`);
+                prCreationError = error.message;
+                // Don't fail the step, report in comment
+              }
+            } else {
+               console.log("No fix branch pushed, skipping PR creation.");
+            }
+
+
+    
